@@ -361,18 +361,26 @@ class TestIncremental:
         source_db.insert_specimen(src, 70, "a", "b")
         source_db.insert_specimen(src, 71, "c", "d")
         target = source_db.max_change_seq(src)
-
         progress_before = replica_db.get_meta(rep)["last_applied_seq"]
 
         # 让副本在“应用这批变更”的 COMMIT 上失败一次（模拟进程在提交点崩溃）。
         # 内置 sqlite3.Connection 不可 monkeypatch，改用带故障的连接工厂。
+        # 全套件下可能有其他写连接也发 COMMIT，因此只在“同步应用批次”的事务
+        # （该连接本事务写过 _applied_changes 审计表）上触发，避免被无关提交消耗。
         real_factory = replica_db._ReplicaConnection  # noqa: SLF001
         crash_state = {"done": False}
 
         class CrashingConnection(real_factory):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._is_apply_batch = False
+
             def execute(self, sql, *args):
+                if isinstance(sql, str) and "_applied_changes" in sql:
+                    self._is_apply_batch = True
                 if (
                     not crash_state["done"]
+                    and self._is_apply_batch
                     and isinstance(sql, str)
                     and sql.strip().upper() == "COMMIT"
                 ):
@@ -383,18 +391,22 @@ class TestIncremental:
         monkeypatch.setattr(replica_db, "_ReplicaConnection", CrashingConnection)
         engine = SyncEngine(src, rep, poll_interval=0.05)
         engine.start()
-        time.sleep(0.5)
-        engine.stop()
+        # 等待工作线程因提交点故障退出（phase=ERROR），此时崩溃批次已整体回滚
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if replica_db.get_meta(rep)["phase"] == replica_db.PHASE_ERROR:
+                break
+            time.sleep(0.02)
         engine.wait_until_idle(10)
         monkeypatch.undo()
 
         assert crash_state["done"], "故障注入未触发"
-        # 崩溃后进度未推进、半成品行不可见（数据与进度共同提交/共同回滚）
-        meta = replica_db.get_meta(rep)
-        assert meta["last_applied_seq"] == progress_before
+        assert replica_db.get_meta(rep)["phase"] == replica_db.PHASE_ERROR
+        # 崩溃批次共同回滚：进度未推进、半成品行不可见
+        assert replica_db.get_meta(rep)["last_applied_seq"] == progress_before
         assert 70 not in replica_rows(rep) and 71 not in replica_rows(rep)
 
-        # 恢复后新引擎从头接续，最终一致
+        # 恢复后新引擎从持久进度接续，最终一致
         run_engine(src, rep, wait_target=target)
         assert replica_rows(rep) == source_rows(src)
 

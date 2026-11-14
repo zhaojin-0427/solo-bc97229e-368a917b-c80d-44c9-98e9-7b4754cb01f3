@@ -32,6 +32,12 @@
   .b-RUNNING { background:var(--ok); } .b-BOOTSTRAP { background:var(--warn); }
   .b-INIT { background:#6b7a70; } .b-STOPPED { background:#555f59; }
   .b-ERROR { background:var(--err); }
+  .b-PUBLISHED { background:var(--ok); } .b-FAILED { background:var(--err); }
+  .pager { display:flex; gap:8px; align-items:center; margin-top:12px; }
+  .pager button { padding:6px 12px; }
+  select { width:100%; padding:9px 11px; border:1px solid var(--line);
+           border-radius:7px; font-size:14px; margin-bottom:10px;
+           background:#fff; }
   button { border:0; border-radius:7px; padding:9px 16px; font-size:14px;
            cursor:pointer; font-weight:600; }
   button.primary { background:var(--brand); color:#fff; }
@@ -126,6 +132,46 @@
   </section>
 
   <section class="card full">
+    <h2>馆藏计数 · 按采集地（locality 精确筛选，分页列 taxon 与标本数）
+      <span id="cntBadge" class="badge b-INIT">未构建</span>
+    </h2>
+    <div class="row"><span class="k">已发布构建</span>
+      <span class="v" id="cntPublished">—</span></div>
+    <div class="row"><span class="k">构建阶段 / 子阶段</span>
+      <span class="v"><span id="cntPhase">—</span> / <span id="cntStage">—</span></span></div>
+    <div class="row"><span class="k">扫描进度（行）</span>
+      <span class="v"><span id="cntScanned">—</span> / <span id="cntTotal">—</span></span></div>
+    <div class="row"><span class="k">日志追平（applied / target 序号）</span>
+      <span class="v"><span id="cntApplied">—</span> / <span id="cntTarget">—</span></span></div>
+    <div class="bar"><i id="cntBar"></i></div>
+    <div class="row" style="margin-top:10px"><span class="k">构建错误</span>
+      <span class="v err" id="cntError">—</span></div>
+    <div class="controls" style="margin-top:14px">
+      <button class="primary" id="btnRebuild">后台（重新）构建计数</button>
+      <span class="muted" id="cntHint" style="align-self:center">
+        计数持久化在副本，查询不扫描标本表；重建期间旧计数照常更新与查询。
+      </span>
+    </div>
+
+    <h2 style="margin-top:20px; font-size:15px;">选择采集地查看各分类馆藏量</h2>
+    <label for="locSelect">采集地（locality，原文精确匹配）</label>
+    <select id="locSelect"><option value="">（计数首次构建完成后可选）</option></select>
+    <table style="margin-top:8px">
+      <thead><tr><th>分类 (taxon)</th><th style="text-align:right">标本数</th></tr></thead>
+      <tbody id="cntBody">
+        <tr><td colspan="2" class="muted">首次计数构建完成前不返回统计…</td></tr>
+      </tbody>
+    </table>
+    <div class="pager">
+      <button class="ghost" id="cntPrev">上一页</button>
+      <span class="muted">第 <span id="cntPage">1</span> /
+        <span id="cntPages">1</span> 页 ·
+        该采集地标本合计 <span id="cntSpecimens">0</span></span>
+      <button class="ghost" id="cntNext">下一页</button>
+    </div>
+  </section>
+
+  <section class="card full">
     <h2>源库 specimens 当前内容（只读参考）</h2>
     <table><thead><tr><th>id</th><th>taxon</th><th>locality</th></tr></thead>
       <tbody id="srcBody"><tr><td colspan="3" class="muted">加载中…</td></tr></tbody></table>
@@ -211,6 +257,100 @@ $("btnDelete").onclick = async () => {
 };
 refresh(); refreshSource();
 setInterval(() => { refresh(); refreshSource(); }, 1500);
+
+// ----------------------------- 馆藏计数 ----------------------------- //
+let cntPage = 1;
+async function refreshCountStatus() {
+  const { data } = await api("/api/counts/status");
+  if (!data) return;
+  const b = data.latest_build;
+  const badge = $("cntBadge");
+  if (data.available) {
+    badge.textContent = "已发布 #" + data.published_build_id;
+    badge.className = "badge b-PUBLISHED";
+  } else if (data.build_running) {
+    badge.textContent = "构建中";
+    badge.className = "badge b-RUNNING";
+  } else {
+    badge.textContent = "未构建";
+    badge.className = "badge b-INIT";
+  }
+  $("cntPublished").textContent = data.published_build_id === null
+    ? "（首次构建完成前不返回统计）" : "#" + data.published_build_id;
+  $("cntPhase").textContent = b ? b.phase : "—";
+  $("cntStage").textContent = b ? (b.stage || "—") : "—";
+  $("cntScanned").textContent = b ? b.scanned_rows : "—";
+  $("cntTotal").textContent = b ? b.total_rows : "—";
+  $("cntApplied").textContent = b ? b.applied_seq : "—";
+  $("cntTarget").textContent = b ? b.target_seq : "—";
+  $("cntError").textContent = (b && b.last_error) || data.last_error || "—";
+  const denom = b ? Math.max(b.total_rows, 1) : 1;
+  const pct = b ? Math.min(100, 100 * b.scanned_rows / denom) : 0;
+  $("cntBar").style.width = pct + "%";
+  $("btnRebuild").disabled = data.build_running;
+}
+async function refreshLocalities(keepSelection) {
+  const r = await api("/api/counts/localities");
+  const sel = $("locSelect");
+  const prev = sel.value;
+  if (r.status === 503) {
+    sel.innerHTML = '<option value="">（计数首次构建完成后可选）</option>';
+    return;
+  }
+  const data = r.data;
+  if (!data.localities || !data.localities.length) {
+    sel.innerHTML = '<option value="">（暂无含计数的采集地）</option>';
+    return;
+  }
+  sel.innerHTML = data.localities.map(l =>
+    `<option value="${escapeHtml(l.locality)}">` +
+    `${escapeHtml(l.locality)}（${l.taxon_groups} 类 / ${l.specimen_total} 件）</option>`
+  ).join("");
+  if (keepSelection && prev) sel.value = prev;
+}
+async function refreshCounts() {
+  const loc = $("locSelect").value;
+  const body = $("cntBody");
+  if (!loc) {
+    body.innerHTML = '<tr><td colspan="2" class="muted">请选择采集地…</td></tr>';
+    return;
+  }
+  const r = await api("/api/counts?locality=" + encodeURIComponent(loc)
+                      + "&page=" + cntPage);
+  if (r.status === 503) {
+    body.innerHTML = '<tr><td colspan="2" class="muted">首次计数构建尚未完成…</td></tr>';
+    return;
+  }
+  const data = r.data;
+  if (!data.items.length) {
+    body.innerHTML = '<tr><td colspan="2" class="muted">该页无数据</td></tr>';
+  } else {
+    body.innerHTML = data.items.map(it =>
+      `<tr><td>${escapeHtml(it.taxon)}</td>` +
+      `<td style="text-align:right;font-variant-numeric:tabular-nums">${it.count}</td></tr>`
+    ).join("");
+  }
+  $("cntPage").textContent = data.page;
+  $("cntPages").textContent = Math.max(1, data.total_pages);
+  $("cntSpecimens").textContent = data.total_specimens;
+  $("cntPrev").disabled = data.page <= 1;
+  $("cntNext").disabled = data.page >= data.total_pages;
+}
+$("btnRebuild").onclick = async () => {
+  const r = await post("/api/counts/rebuild", {});
+  flash(r.ok ? "计数构建已在后台开始（旧计数继续可用）"
+             : ("无法开始：" + (r.data.message || "")), r.ok);
+  refreshCountStatus();
+};
+$("locSelect").onchange = () => { cntPage = 1; refreshCounts(); };
+$("cntPrev").onclick = () => { if (cntPage > 1) { cntPage--; refreshCounts(); } };
+$("cntNext").onclick = () => { cntPage++; refreshCounts(); };
+refreshCountStatus(); refreshLocalities(false); refreshCounts();
+setInterval(() => {
+  refreshCountStatus();
+  refreshLocalities(true);
+  refreshCounts();
+}, 2000);
 </script>
 </body>
 </html>

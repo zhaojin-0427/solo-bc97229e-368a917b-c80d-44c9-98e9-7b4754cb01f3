@@ -4,6 +4,45 @@
 查询；鉴定员仍直接在源库登记、更正、撤回。提供 Flask 网页启动/停止同步、查看
 进度与错误、按标本号查询副本，并附带可持续修改的示例源库。
 
+此外提供**馆藏计数**：博物馆研究员按采集地（locality 原文精确筛选）分页查看各
+分类（taxon）的标本数。计数持久化在副本中，查询只走索引、绝不临时扫描标本表；
+支持后台首次构建与重建，构建期间同步、标本查询、源更正全程可用。
+
+## 馆藏计数：需求与实现对照
+
+| 需求 | 实现方式 |
+| --- | --- |
+| 按 locality 精确筛选，分页列 taxon 与标本数 | `GET /api/counts?locality=...&page=...`，两字段按原文本分组（大小写/空格不同即不同组），覆盖索引 `idx_taxon_counts_loc_taxon` 分页 |
+| 零计数组不显示 | `taxon_counts.cnt` 带 `CHECK (cnt > 0)`，计数降为 0 的组在同事务内直接删除 |
+| 计数持久化、查询不临时扫描标本表 | 计数落在副本表 `taxon_counts`；页面查询的执行计划只命中该表索引，不接触 `specimens` |
+| 可后台首次构建或重建 | `CountBuildManager` 守护线程：副本就绪后自动首次构建；`POST /api/counts/rebuild` 手动重建 |
+| 扫描期间同步/标本查询/源更正继续可用，不持副本写事务等全量扫描 | 扫描按固定页大小分页、每页独立短事务（扫描页为只读）；SQLite 单一写者，构建器不与同步器争锁，增量由同步器在其应用事务内顺带汇入 |
+| 新计数发布须纳入构建期间的增删改 | 构建登记水位 `start_seq`；同步器经 `apply_staging_delta` 把后续变更写入构建影像；收尾再从源端 CDC 对 `(start_seq, w]` 做幂等权威重放，确定覆盖一切时序缺口；发布水位写入 `count_meta.published_seq` |
+| 计数随副本记录、审计、进度同事务更新；换组更正扣旧组加新组 | `apply_count_delta` 在同步器 `_apply_batch` 的同一事务内调用，与标本行、`_applied_changes`、`sync_meta` 一起 COMMIT/ROLLBACK；更新先读旧组，扣旧加新；序号 ≤ `published_seq` 的变更跳过，杜绝发布窗口重复 |
+| 重建期间旧计数继续更新并供查询，完整新计数才可替换 | 重建只写 `build_id` 隔离的暂存表，`taxon_counts` 始终是上一版完整计数；只有追平水位后才在单事务内 DELETE+INSERT 交换并翻转 `published_build_id`/`published_seq` |
+| 失败或重启保留旧计数，未完成构建标失败，首次完成前不返回统计 | 失败/重启把停在 RUNNING 的构建标 FAILED 并清理暂存，旧发布计数不动；`published_build_id IS NULL` 时计数接口返回 503 |
+| 构建全程有界内存 | 全量影像落在磁盘暂存表，扫描/CDC 重放/聚合都按固定页大小分批处理，内存以页大小为界 |
+| 页面显示进度及错误 | 计数卡片展示阶段/子阶段、扫描行数、日志追平水位、进度条与 `last_error`，定时刷新 |
+
+### 计数构建为什么正确（单一写者 + CDC 权威重放 + 发布水位去重）
+
+SQLite 同一时刻只允许一个写事务，因此让**同步器始终是副本的唯一写者**，构建器
+不自己长期占用写锁：
+
+1. 构建登记当前同步水位 `start_seq`，分页只读扫描 `specimens` 写入磁盘影像
+   `count_build_rows`（每页短事务，有界内存）；扫描期间同步器在它本来的应用
+   事务内通过 `apply_staging_delta` 顺带把每条变更 upsert/delete 进同一影像；
+2. 等同步器追平某个采样水位 w 后，从源端变更日志把区间 `(start_seq, w]`
+   **幂等重放**进影像（I/U upsert、D 删除）。日志区间是确定的，覆盖移动游标
+   扫描竞争、连续构建注册窗口等一切时序缺口，使影像严格等于水位 w 的标本全集；
+3. 分页聚合影像为 `count_build_counts`；
+4. 在只做交换的短事务内发布：若获取写锁前同步器已越过 w，则在同一事务内把
+   CDC `(w, sync_seq]` 补进影像并重算聚合，然后整体替换 `taxon_counts`，把
+   `published_build_id` 与 `published_seq=sync_seq` 一起翻转。同步器之后对
+   序号 ≤ `published_seq` 的批次会跳过计数维护（已包含在全量影像中），序号
+   更大的批次才增量维护，因此发布窗口既不遗漏也不重复。
+
+
 ## 需求与实现对照
 
 | 需求 | 实现方式 |
@@ -40,8 +79,11 @@
                             ▼
                     副本 specimens_replica.db (独立 SQLite)
               specimens / sync_meta(持久进度) / _applied_changes(审计)
+              taxon_counts(已发布计数) / count_meta(当前发布构建)
+              count_builds(构建状态/进度/错误)
+              count_build_rows / count_build_counts(构建暂存影像与聚合)
                             ▲
-              Flask 网页（仅 RUNNING 可查，否则 503）
+              Flask 网页（标本仅 RUNNING 可查；计数首次发布前返回 503）
 ```
 
 ### 首次复制为什么正确（并发窗口）
@@ -59,14 +101,15 @@
 ```
 app/
   source_db.py     源库：WAL、specimens、CDC 表与触发器、演示写入 API
-  replica_db.py    副本：表结构、持久进度 meta、就绪判定、查询
+  replica_db.py    副本：表结构（含计数表/暂存表）、持久进度、就绪判定、查询
+  counts.py        馆藏计数：事务内增量维护 + 后台首次构建/重建管理器
   sync.py          同步引擎：bootstrap + 增量循环，后台线程生命周期
   web.py           Flask 应用与 REST API
-  templates/index.html  控制台页面
+  templates/index.html  控制台页面（同步控制、标本查询、馆藏计数）
 scripts/
   seed_source.py   播种示例源库（容器入口调用）
   demo_mutator.py  持续演示写入器（周期增/改/撤）
-tests/             27 个 pytest 测试（CDC 正确性、并发、崩溃、续跑、Web E2E）
+tests/             46 个 pytest 测试（CDC 正确性、并发、崩溃、续跑、计数构建/重建、Web E2E）
 Dockerfile, docker-compose.yml, entrypoint.sh, wsgi.py
 ```
 
@@ -84,7 +127,9 @@ docker compose up -d --build
 
 * 查看同步阶段（INIT/BOOTSTRAP/RUNNING/STOPPED/ERROR）、已应用序号、源端水位、错误；
 * 启动/停止同步；按标本号查询副本（未就绪时返回 503）；
-* 在页面上直接对**源库**新增 / 更正 / 撤回，观察副本自动追上。
+* 在页面上直接对**源库**新增 / 更正 / 撤回，观察副本自动追上；
+* 在“馆藏计数”卡片查看构建进度与错误、选择采集地分页浏览各分类标本数，
+  或点击“后台（重新）构建计数”。副本就绪后系统也会自动完成首次构建。
 
 附带一个持续写入器，模拟鉴定员不停操作（可选 profile，不影响主服务）：
 
@@ -116,6 +161,10 @@ python -m flask --app wsgi:app run --port 8000
 | `POST /api/sync/stop` | 请求停止（当前批次完成后退出，phase=STOPPED） |
 | `GET  /api/status` | 阶段、`last_applied_seq`、源端水位、已拷贝行数、错误、线程状态 |
 | `GET  /api/specimen/<id>` | 按标本号查副本；未就绪 503，不存在/已撤回 404 |
+| `GET  /api/counts?locality=...&page=n` | 按 locality 原文精确筛选，分页返回 taxon 与标本数；首次发布前 503，缺 locality 400 |
+| `GET  /api/counts/localities` | 已发布计数中的采集地及各地分组数/标本合计；首次发布前 503 |
+| `GET  /api/counts/status` | 计数是否可用、当前发布构建、最新构建阶段/进度/错误、是否构建中 |
+| `POST /api/counts/rebuild` | 后台（重新）构建计数；副本未就绪 503，已有构建在跑 409 |
 | `POST /api/demo/insert` | 对源库新增 `{id,taxon,locality}` |
 | `POST /api/demo/update` | 对源库更正 `{id,taxon,locality}` |
 | `POST /api/demo/delete` | 撤回源记录 `{id}` |
@@ -132,7 +181,11 @@ pytest tests/ -v
 覆盖要点：触发器捕获全部 DML、回滚不传播、已提交序号单调、单事务多行原子可见、
 首次复制期间并发增删改的最终一致性、删除不复活、旧值不覆盖新值、中断重做、
 重启按持久进度接续且不重做快照、提交点崩溃后数据与进度均不半生效、增量走索引
-不全表扫描、同步期间源写入不被阻塞、就绪前 503、Web 端到端增改撤链路。
+不全表扫描、同步期间源写入不被阻塞、就绪前 503、Web 端到端增改撤链路；计数首次
+构建与 GROUP BY 一致、原文本精确分组、零计数组不显示、查询走索引不扫标本表、
+增删/换组更正同事务扣旧加新、提交点共同回滚、重建期间旧计数可用、失败保留旧计数、
+重启善后与自动首次构建、高并发增删改下发布计数严格正确、有界内存短事务、
+计数 Web API 的 503/400/409 与分页语义。
 
 ## 关键环境变量
 
@@ -144,4 +197,9 @@ pytest tests/ -v
 | `POLL_INTERVAL` | `1.0` | 无新变更时的轮询秒数（stop 可立即唤醒） |
 | `SNAPSHOT_PAGE_SIZE` | `500` | 首次复制快照每页行数 |
 | `CHANGE_BATCH_SIZE` | `500` | 增量每批应用的日志条数 |
+| `COUNT_SCAN_PAGE_SIZE` | `500` | 计数构建扫描/CDC 重放每页行数（有界内存） |
+| `COUNT_AGG_PAGE_SIZE` | `500` | 计数构建聚合每页行数 |
+| `BUILD_WAIT_INTERVAL` | `0.2` | 发布前等待同步器追平采样水位的轮询秒数 |
+| `SUPERVISOR_INTERVAL` | `0.5` | 计数监督线程（重启善后/自动首次构建）轮询秒数 |
+| `COUNTS_PAGE_SIZE` | `20` | 馆藏计数页面每页展示的 taxon 组数 |
 | `MUTATOR_INTERVAL` | `3` | 演示写入器操作间隔秒数 |

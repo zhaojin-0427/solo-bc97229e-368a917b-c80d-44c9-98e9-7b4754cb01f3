@@ -1,11 +1,17 @@
 """自然博物馆标本登记库同步 Web 控制台（Flask）。
 
 页面与 API：
-  GET  /                 控制台页面（进度、错误、操作按钮、查询框）
+  GET  /                 控制台页面（同步进度、错误、操作按钮、查询框、馆藏计数）
   POST /api/sync/start   启动后台同步
   POST /api/sync/stop    请求停止后台同步
   GET  /api/status       同步进度与错误（JSON）
   GET  /api/specimen/<id>  按标本号查询副本（就绪前返回 503）
+
+  # 馆藏计数（持久化，按 locality 精确筛选、分页列 taxon 与标本数）
+  GET  /api/counts/localities          可选采集地与各地汇总（仅已发布计数）
+  GET  /api/counts?locality=...&page=  分页计数（首次构建完成前 503）
+  GET  /api/counts/status              构建进度、阶段与错误（JSON）
+  POST /api/counts/rebuild             后台重建（构建中再次请求返回 409）
 
   # 演示用：直接对源库提交增 / 改 / 撤（鉴定员的日常操作）
   POST /api/demo/insert
@@ -19,6 +25,7 @@ import os
 
 from flask import Flask, jsonify, render_template, request
 
+from . import counts as counts_mod
 from . import replica_db, source_db
 from .sync import SyncEngine
 
@@ -27,6 +34,8 @@ REPLICA_DB = os.environ.get("REPLICA_DB", "/data/replica/specimens_replica.db")
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "1.0"))
 # 容器启动时是否自动开始同步（1/0）
 AUTO_START = os.environ.get("AUTO_START", "1") == "1"
+# 计数分页每页组数
+COUNTS_PAGE_SIZE = int(os.environ.get("COUNTS_PAGE_SIZE", "20"))
 
 
 def create_app(
@@ -44,11 +53,18 @@ def create_app(
     engine = SyncEngine(source_path, replica_path, poll_interval=interval)
     app.config["SYNC_ENGINE"] = engine
 
+    # 计数构建管理器：重启善后、副本就绪后自动首次构建、手动重建。
+    # 注册到同步引擎：同步器作为副本唯一写者，把变更顺带汇入活动构建影像。
+    build_manager = counts_mod.CountBuildManager(source_path, replica_path)
+    engine.count_build_manager = build_manager
+    app.config["COUNT_BUILD_MANAGER"] = build_manager
+
     # 确保示例源库与副本结构存在（源库不存在则播种演示数据）
     source_db.init_demo(source_path)
     replica_db.init_replica(replica_path)
     if do_auto_start:
         engine.start()
+    build_manager.start_supervisor()
 
     # ----------------------------- 页面 ----------------------------- #
     @app.get("/")
@@ -158,6 +174,94 @@ def create_app(
         finally:
             conn.close()
         return jsonify([dict(r) for r in rows])
+
+    # --------------------------- 馆藏计数 --------------------------- #
+    @app.get("/api/counts/localities")
+    def counts_localities():
+        if not replica_db.count_is_available(replica_path):
+            return _counts_unavailable()
+        return jsonify(
+            {
+                "published_build_id":
+                    replica_db.get_published_build_id(replica_path),
+                "localities":
+                    replica_db.list_localities_with_counts(replica_path),
+            }
+        )
+
+    @app.get("/api/counts")
+    def counts_query():
+        locality = request.args.get("locality", "")
+        if not locality:
+            return (
+                jsonify(
+                    {
+                        "error": "BAD_REQUEST",
+                        "message": "必须提供 locality 参数（按采集地原文精确筛选）",
+                    }
+                ),
+                400,
+            )
+        # 首次构建完成前不返回统计
+        if not replica_db.count_is_available(replica_path):
+            return _counts_unavailable()
+        try:
+            page = int(request.args.get("page", "1"))
+        except ValueError:
+            page = 1
+        result = replica_db.count_taxa_for_locality(
+            replica_path, locality, page, COUNTS_PAGE_SIZE
+        )
+        result["published_build_id"] = replica_db.get_published_build_id(
+            replica_path
+        )
+        return jsonify(result)
+
+    @app.get("/api/counts/status")
+    def counts_status():
+        return jsonify(build_manager.status())
+
+    @app.post("/api/counts/rebuild")
+    def counts_rebuild():
+        # 重建以 RUNNING 副本为前提；副本未就绪时明确拒绝
+        if not replica_db.is_ready(replica_path):
+            meta = replica_db.get_meta(replica_path)
+            return (
+                jsonify(
+                    {
+                        "error": "REPLICA_NOT_READY",
+                        "message": "副本尚未完成首次复制，暂不能构建计数",
+                        "phase": meta["phase"],
+                    }
+                ),
+                503,
+            )
+        build_id = build_manager.start_build()
+        if build_id is None:
+            return (
+                jsonify(
+                    {
+                        "error": "BUILD_IN_PROGRESS",
+                        "message": "已有计数构建在运行，请等待其完成",
+                        "status": build_manager.status(),
+                    }
+                ),
+                409,
+            )
+        return jsonify({"started": True, "build_id": build_id})
+
+    def _counts_unavailable():
+        latest = replica_db.get_latest_build(replica_path)
+        return (
+            jsonify(
+                {
+                    "error": "COUNTS_NOT_AVAILABLE",
+                    "message": "馆藏计数首次构建尚未完成，暂不提供统计",
+                    "latest_build": latest,
+                }
+            ),
+            503,
+        )
 
     @app.get("/healthz")
     def healthz():

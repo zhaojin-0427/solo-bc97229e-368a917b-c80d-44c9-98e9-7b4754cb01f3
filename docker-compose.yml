@@ -12,6 +12,11 @@ services:
       AUTO_START: "1"
       SNAPSHOT_PAGE_SIZE: "500"
       CHANGE_BATCH_SIZE: "500"
+      # 馆藏计数：分页大小、构建轮询、每页展示组数
+      COUNT_SCAN_PAGE_SIZE: "500"
+      COUNT_AGG_PAGE_SIZE: "500"
+      BUILD_WAIT_INTERVAL: "0.2"
+      COUNTS_PAGE_SIZE: "20"
     volumes:
       - source_data:/data/source
       - replica_data:/data/replica

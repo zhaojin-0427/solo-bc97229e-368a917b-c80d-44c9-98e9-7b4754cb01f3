@@ -43,6 +43,7 @@ import threading
 import time
 from typing import Optional
 
+from . import counts as counts_mod
 from . import replica_db
 from .source_db import (
     CHANGE_BATCH_SIZE,
@@ -60,6 +61,9 @@ class SyncEngine:
         self.source_path = source_path
         self.replica_path = replica_path
         self.poll_interval = poll_interval
+        # 可选的计数构建管理器：同步器作为副本唯一写者，顺带把变更并入
+        # 活动构建的暂存影像（避免构建器与同步器争抢副本写锁）
+        self.count_build_manager = None
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         # bootstrap 开始/完成事件，便于外部（如测试）确定性地观察阶段
@@ -316,6 +320,12 @@ class SyncEngine:
             return last_seq
 
         new_last = int(changes[-1]["seq"])
+        # 活动构建（若有）：本批变更在同一事务汇入其暂存影像
+        active_build = (
+            self.count_build_manager.get_active_build_id()
+            if self.count_build_manager is not None
+            else None
+        )
         with replica_db.open_replica(self.replica_path) as rconn:
             rconn.execute("BEGIN IMMEDIATE")
             for ch in changes:
@@ -323,7 +333,19 @@ class SyncEngine:
                     rconn.execute("ROLLBACK")
                     self._mark_stopped()
                     return None
+                if active_build is not None:
+                    counts_mod.apply_staging_delta(
+                        rconn, active_build, ch["op"], ch["id"],
+                        ch["taxon"], ch["locality"],
+                    )
                 if ch["op"] in ("I", "U"):
+                    # 计数维护必须在 REPLACE 之前：此时标本行仍是旧值（若存在），
+                    # apply_count_delta 据此在同一事务内扣旧组、加新组；
+                    # 传入 seq 以跳过已包含在已发布计数中的变更（发布窗口去重）
+                    counts_mod.apply_count_delta(
+                        rconn, ch["op"], ch["id"], ch["taxon"], ch["locality"],
+                        ch["seq"],
+                    )
                     # INSERT OR REPLACE：以日志携带的最新鉴定为准，
                     # 旧鉴定不会覆盖新值（日志按 seq 升序应用）
                     rconn.execute(
@@ -331,7 +353,10 @@ class SyncEngine:
                         " VALUES (?, ?, ?)",
                         (ch["id"], ch["taxon"], ch["locality"]),
                     )
-                else:  # 'D'：撤回，删除且不会被后续快照复活
+                else:  # 'D'：撤回，先按现存旧组扣减计数再删除，且不会被后续快照复活
+                    counts_mod.apply_count_delta(
+                        rconn, ch["op"], ch["id"], None, None, ch["seq"]
+                    )
                     rconn.execute(
                         "DELETE FROM specimens WHERE id = ?", (ch["id"],)
                     )
